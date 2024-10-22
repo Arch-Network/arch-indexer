@@ -38,4 +38,3 @@ networks:
     external: true
     name: arch-cli_arch-network
   internal:
-    external: true
