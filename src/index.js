@@ -74,8 +74,8 @@ async function syncBlocks() {
     console.log(`Current block height: ${currentBlockHeight}, Latest block height: ${latestBlockHeight}`);
 
     // Reduce batch size and concurrent batches
-    const BATCH_SIZE = 50;    // Reduced from 100
-    const CONCURRENT_BATCHES = 3;  // Reduced from 5
+    const BATCH_SIZE = 100;
+    const CONCURRENT_BATCHES = 5;
 
     while (currentBlockHeight <= latestBlockHeight) {
       const batchPromises = [];
@@ -165,19 +165,31 @@ async function storeBlock(block) {
     ]);
 
     if (block.transactions && block.transactions.length > 0) {
-      const txPromises = block.transactions.map(async (txId) => {
-        const tx = await archClient.getProcessedTransaction(txId);
-        // Use prepared statement for transaction insertion
-        return client.query(preparedStatements.insertTx, [
-          txId,
-          block.height,
-          JSON.stringify(tx.runtime_transaction),
-          tx.status === 'Processing' ? 0 : 1,
-          tx.bitcoin_txids && tx.bitcoin_txids.length > 0 ? tx.bitcoin_txids : '{}'
-        ]);
-      });
-
-      await Promise.all(txPromises);
+      // Batch transactions in groups of 50
+      const batchSize = 50;
+      for (let i = 0; i < block.transactions.length; i += batchSize) {
+        const batch = block.transactions.slice(i, i + batchSize);
+        const txPromises = batch.map(async (txId) => {
+          const tx = await archClient.getProcessedTransaction(txId);
+          return {
+            txId,
+            tx
+          };
+        });
+    
+        const txResults = await Promise.all(txPromises);
+        const queries = txResults.map(({txId, tx}) => 
+          client.query(preparedStatements.insertTx, [
+            txId,
+            block.height,
+            JSON.stringify(tx.runtime_transaction),
+            tx.status === 'Processing' ? 0 : 1,
+            tx.bitcoin_txids && tx.bitcoin_txids.length > 0 ? tx.bitcoin_txids : '{}'
+          ])
+        );
+        
+        await Promise.all(queries);
+      }
     }
 
     await client.query('COMMIT');
