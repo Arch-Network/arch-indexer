@@ -3,3 +3,8 @@ node_modules/
 
 # Ignore Trunk
 .trunk/
+
+# Environment variables
+.env
+.env.*
+!.env.example

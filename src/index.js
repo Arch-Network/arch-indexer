@@ -2,20 +2,54 @@ const express = require('express');
 const { Pool } = require('pg');
 const { ArchRpcClient } = require('arch-typescript-sdk');
 const cors = require('cors');
+const { initializeDatabase } = require('./db-init');
+
+require('dotenv').config();
 
 const app = express();
 app.use(cors());
 
-const port = process.env.INDEXER_PORT || 3003;
+// Use INDEXER_PORT if set, fallback to PORT (for Cloud Run), or default to 3003
+const port = process.env.PORT || process.env.INDEXER_PORT || 3003;
+
 const MAX_RETRIES = 10;
 const RETRY_DELAY = 5000; // 5 seconds
 
+const preparedStatements = {
+  insertBlock: {
+    name: 'insert-block',
+    text: `INSERT INTO blocks (height, hash, timestamp, bitcoin_block_height) 
+           VALUES ($1, $2, $3, $4) 
+           ON CONFLICT (height) DO UPDATE 
+           SET hash = EXCLUDED.hash, 
+               timestamp = EXCLUDED.timestamp, 
+               bitcoin_block_height = EXCLUDED.bitcoin_block_height`
+  },
+  insertTx: {
+    name: 'insert-tx',
+    text: `INSERT INTO transactions (txid, block_height, data, status, bitcoin_txids)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (txid) DO UPDATE
+           SET block_height = EXCLUDED.block_height,
+               data = EXCLUDED.data,
+               status = EXCLUDED.status,
+               bitcoin_txids = EXCLUDED.bitcoin_txids`
+  }
+};
+
 const pool = new Pool({
   user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT,
+  database: process.env.DB_NAME,
+  port: parseInt(process.env.DB_PORT || '5432'),
+  host: process.env.INSTANCE_CONNECTION_NAME
+    ? `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`
+    : process.env.DB_HOST,
+  max: 20,
+  min: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+  maxUses: 7500,
 });
 
 const archClient = new ArchRpcClient(process.env.ARCH_NODE_URL);
@@ -26,6 +60,7 @@ let syncStartTime = Date.now();
 let lastBlockTime = Date.now();
 let averageBlockTime = 0;
 
+// Increase batch size and add concurrent batch processing
 async function syncBlocks() {
   try {
     const isReady = await archClient.isNodeReady();
@@ -38,32 +73,81 @@ async function syncBlocks() {
     const latestBlockHeight = await archClient.getBlockCount();
     console.log(`Current block height: ${currentBlockHeight}, Latest block height: ${latestBlockHeight}`);
 
-    while (currentBlockHeight <= latestBlockHeight) {
-      const blockStartTime = Date.now();
-      try {
-        const blockHash = await archClient.getBlockHash(currentBlockHeight);
-        const block = await archClient.getBlock(blockHash);
-        block.height = currentBlockHeight;
-        block.hash = blockHash;
-        await storeBlock(block);
-        currentBlockHeight++;
-        console.log(`Synced block at height ${currentBlockHeight}`);
+    // Reduce batch size and concurrent batches
+    const BATCH_SIZE = 50;    // Reduced from 100
+    const CONCURRENT_BATCHES = 3;  // Reduced from 5
 
-        const blockTime = Date.now() - blockStartTime;
-        averageBlockTime = averageBlockTime === 0 ? blockTime : (averageBlockTime * 0.9 + blockTime * 0.1);
-        lastBlockTime = Date.now();
+    while (currentBlockHeight <= latestBlockHeight) {
+      const batchPromises = [];
+
+      for (let i = 0; i < CONCURRENT_BATCHES; i++) {
+        const batchStart = currentBlockHeight + (i * BATCH_SIZE);
+        if (batchStart > latestBlockHeight) break;
+
+        const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, latestBlockHeight);
+        const blockPromises = [];
+
+        for (let height = batchStart; height <= batchEnd; height++) {
+          blockPromises.push(processBlock(height));
+        }
+
+        batchPromises.push(Promise.all(blockPromises)
+          .then(() => {
+            console.log(`Processed blocks ${batchStart} to ${batchEnd}`);
+            return batchEnd;
+          })
+          .catch(error => {
+            console.error(`Error in batch ${batchStart}-${batchEnd}:`, error);
+            throw error;
+          }));
+      }
+
+      try {
+        const completedBatchEnds = await Promise.all(batchPromises);
+        currentBlockHeight = Math.max(...completedBatchEnds) + 1;
       } catch (error) {
-        console.error(`Error processing block at height ${currentBlockHeight}:`, error);
-        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds before retrying
+        console.error('Batch processing failed:', error);
+        await new Promise(resolve => setTimeout(resolve, 2000)); // Increased delay
+        continue;
       }
     }
 
-    // Determine the delay for the next sync attempt
-    const delay = currentBlockHeight >= latestBlockHeight ? 1000 : 10000;
+    const delay = currentBlockHeight >= latestBlockHeight ? 1000 : 100;
     setTimeout(syncBlocks, delay);
   } catch (error) {
     console.error('Error syncing blocks:', error);
-    setTimeout(syncBlocks, 10000);
+    setTimeout(syncBlocks, 5000);
+  }
+}
+
+pool.on('error', (err, client) => {
+  console.error('Unexpected error on idle client', err);
+  if (client) {
+    client.release(true); // Force release the client
+  }
+});
+
+setInterval(() => {
+  console.log(`Pool status - total: ${pool.totalCount}, idle: ${pool.idleCount}, waiting: ${pool.waitingCount}`);
+}, 30000);
+
+async function processBlock(height) {
+  const blockStartTime = Date.now();
+  try {
+    const blockHash = await archClient.getBlockHash(height);
+    const block = await archClient.getBlock(blockHash);
+    block.height = height;
+    block.hash = blockHash;
+    await storeBlock(block);
+
+    const blockTime = Date.now() - blockStartTime;
+    averageBlockTime = averageBlockTime === 0 ? blockTime : (averageBlockTime * 0.9 + blockTime * 0.1);
+    lastBlockTime = Date.now();
+
+    return block;
+  } catch (error) {
+    console.error(`Error processing block at height ${height}:`, error);
+    throw error;
   }
 }
 
@@ -71,41 +155,29 @@ async function storeBlock(block) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query(
-      `INSERT INTO blocks (height, hash, timestamp, bitcoin_block_height) 
-       VALUES ($1, $2, $3, $4) 
-       ON CONFLICT (height) DO UPDATE 
-       SET hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp, 
-           bitcoin_block_height = EXCLUDED.bitcoin_block_height`,
-      [block.height, block.hash, block.timestamp, block.bitcoin_block_height]
-    );
 
-    // Store the block even if there are no transactions
-    console.log(`Stored block at height ${block.height}`);
+    // Use prepared statement for block insertion
+    await client.query(preparedStatements.insertBlock, [
+      block.height,
+      block.hash,
+      block.timestamp,
+      block.bitcoin_block_height
+    ]);
 
     if (block.transactions && block.transactions.length > 0) {
-      const transactionPromises = block.transactions.map(async (txId) => {
+      const txPromises = block.transactions.map(async (txId) => {
         const tx = await archClient.getProcessedTransaction(txId);
-        return client.query(
-          `INSERT INTO transactions (txid, block_height, data, status, bitcoin_txids) 
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (txid) DO UPDATE
-           SET block_height = EXCLUDED.block_height, data = EXCLUDED.data, 
-               status = EXCLUDED.status, bitcoin_txids = EXCLUDED.bitcoin_txids`,
-          [
-            txId,
-            block.height,
-            JSON.stringify(tx.runtime_transaction),
-            tx.status === 'Processing' ? 0 : 1,
-            tx.bitcoin_txids && tx.bitcoin_txids.length > 0 ? tx.bitcoin_txids : '{}'
-          ]
-        );
+        // Use prepared statement for transaction insertion
+        return client.query(preparedStatements.insertTx, [
+          txId,
+          block.height,
+          JSON.stringify(tx.runtime_transaction),
+          tx.status === 'Processing' ? 0 : 1,
+          tx.bitcoin_txids && tx.bitcoin_txids.length > 0 ? tx.bitcoin_txids : '{}'
+        ]);
       });
 
-      await Promise.all(transactionPromises);
-      console.log(`Stored ${block.transactions.length} transactions for block at height ${block.height}`);
-    } else {
-      console.log(`No transactions to store for block at height ${block.height}`);
+      await Promise.all(txPromises);
     }
 
     await client.query('COMMIT');
@@ -284,16 +356,17 @@ async function storeBlock(block) {
 
   // Initialize currentBlockHeight before starting the sync process
   app.listen(port, '0.0.0.0', async () => {
-    console.log(`Indexer API listening at http://localhost:${port}`);
+    console.log(`Indexer API listening at http://0.0.0.0:${port}`);
     try {
       await connectWithRetry();
+      await initializeDatabase(pool);
       const result = await pool.query('SELECT MAX(height) as max_height FROM blocks');
       currentBlockHeight = result.rows[0].max_height || 0;
       console.log(`Starting sync from block height: ${currentBlockHeight}`);
-      syncStartTime = Date.now(); // Reset sync start time
+      syncStartTime = Date.now();
       syncBlocks();
     } catch (error) {
-      console.error('Error initializing currentBlockHeight:', error);
+      console.error('Error during startup:', error);
       process.exit(1);
     }
   });
